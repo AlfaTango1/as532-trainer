@@ -1,0 +1,174 @@
+name: Build APK
+
+# Run from the Actions tab ("Run workflow"), or automatically when index.html changes.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['index.html', '.github/workflows/build-apk.yml']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Get the files
+        uses: actions/checkout@v5
+
+      - name: Check the files are in the right place
+        run: |
+          if [ ! -f index.html ]; then
+            echo "::error::index.html must be in the main folder of the repository (not inside a sub-folder or a zip)."
+            find . -not -path './.git/*' | head -50
+            exit 1
+          fi
+
+      - name: Install Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - name: Install Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Create the Android project
+        run: |
+          mkdir -p app/www app/assets
+          cp index.html app/www/index.html
+          cp icon-192.png icon-512.png app/www/ 2>/dev/null || true
+          cp icon-512.png app/assets/logo.png 2>/dev/null || true
+          cd app
+          npm init -y > /dev/null
+          npm install --no-audit --no-fund --legacy-peer-deps \
+            @capacitor/core@7 @capacitor/cli@7 @capacitor/android@7 @capacitor/app@7
+          cat > capacitor.config.json <<'JSON'
+          {
+            "appId": "io.github.alfatango1.as532trainer",
+            "appName": "AS 532 Trainer",
+            "webDir": "www",
+            "android": { "adjustMarginsForEdgeToEdge": "auto" }
+          }
+          JSON
+          npx cap add android
+          npx cap sync android
+
+      - name: Keyboard, portrait screen and version number
+        run: |
+          cd app/android/app
+          python3 - <<'PY'
+          p = 'src/main/AndroidManifest.xml'
+          s = open(p).read()
+          if 'windowSoftInputMode' not in s:
+              s = s.replace('android:name=".MainActivity"', 'android:name=".MainActivity"\n android:windowSoftInputMode="adjustResize"\n android:screenOrientation="portrait"', 1)
+          open(p, 'w').write(s)
+          PY
+          sed -i "s/versionCode [0-9]*/versionCode ${{ github.run_number }}/" build.gradle
+          sed -i "s/versionName \"[^\"]*\"/versionName \"1.0.${{ github.run_number }}\"/" build.gradle
+          cp -r src/main/res /tmp/res-original
+          cp build.gradle /tmp/build.gradle.original
+
+      - name: Keep text inside buttons (limit phone font scaling)
+        run: |
+          python3 - <<'PY'
+          import glob, re
+          for p in glob.glob('app/android/app/src/main/java/**/MainActivity.java', recursive=True):
+              s = open(p).read()
+              if 'setTextZoom' in s:
+                  continue
+              body = ('{\n'
+                      ' @Override\n'
+                      ' public void onCreate(android.os.Bundle savedInstanceState) {\n'
+                      ' super.onCreate(savedInstanceState);\n'
+                      ' try {\n'
+                      ' android.webkit.WebSettings ws = getBridge().getWebView().getSettings();\n'
+                      ' ws.setTextZoom(Math.min(ws.getTextZoom(), 110));\n'
+                      ' } catch (Exception e) { }\n'
+                      ' }\n'
+                      '}')
+              s2 = re.sub(r'extends BridgeActivity\s*\{\s*\}', 'extends BridgeActivity ' + body, s)
+              open(p, 'w').write(s2)
+              print(p); print(s2)
+          PY
+
+      - name: Build the APK
+        run: |
+          cd app
+          LOG="$GITHUB_WORKSPACE/gradle.log"
+          NOTE=""
+
+          add_icons() {
+            npx --yes @capacitor/assets@3 generate --android \
+              --iconBackgroundColor '#1C2420' --iconBackgroundColorDark '#1C2420' \
+              --splashBackgroundColor '#1C2420' --splashBackgroundColorDark '#1C2420' || echo "Icon generation skipped"
+          }
+          use_fixed_key() {
+            [ -f "$GITHUB_WORKSPACE/debug.keystore" ] || return 0
+            python3 - <<'PY'
+          import os
+          p = 'android/app/build.gradle'
+          s = open(p).read()
+          ks = os.environ['GITHUB_WORKSPACE'] + '/debug.keystore'
+          block = ('android {\n signingConfigs {\n debug {\n'
+                   ' storeFile file("' + ks + '")\n'
+                   ' storePassword "android"\n keyAlias "androiddebugkey"\n keyPassword "android"\n'
+                   ' }\n }\n')
+          if 'debug.keystore' not in s:
+              s = s.replace('android {', block, 1)
+          open(p, 'w').write(s)
+          PY
+          }
+          build() {
+            echo "===== Build attempt: $1 ====="
+            (cd android && chmod +x gradlew && ./gradlew assembleDebug --no-daemon --stacktrace) > "$LOG" 2>&1
+            local code=$?
+            tail -40 "$LOG"
+            return $code
+          }
+
+          add_icons
+          use_fixed_key
+          if build "full"; then NOTE="Built normally."
+          else
+            echo "::warning::First attempt failed, retrying with default icons."
+            rm -rf android/app/src/main/res && cp -r /tmp/res-original android/app/src/main/res
+            if build "default icons"; then NOTE="Built with the default Android icon."
+            else
+              echo "::warning::Retrying without the fixed signing key."
+              cp /tmp/build.gradle.original android/app/build.gradle
+              if build "default key"; then NOTE="Built without the fixed signing key: uninstall the old app before installing."
+              else
+                echo "## Build failed" >> "$GITHUB_STEP_SUMMARY"
+                echo '```' >> "$GITHUB_STEP_SUMMARY"
+                grep -A20 "What went wrong" "$LOG" | head -60 >> "$GITHUB_STEP_SUMMARY" || tail -60 "$LOG" >> "$GITHUB_STEP_SUMMARY"
+                echo '```' >> "$GITHUB_STEP_SUMMARY"
+                grep -A6 "What went wrong" "$LOG" | head -14 | while IFS= read -r line; do
+                  [ -n "$line" ] && echo "::error title=Gradle::$line"
+                done
+                exit 1
+              fi
+            fi
+          fi
+          cp android/app/build/outputs/apk/debug/app-debug.apk "$GITHUB_WORKSPACE/AS532-Trainer.apk"
+          echo "$NOTE" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "NOTE=$NOTE" >> "$GITHUB_ENV"
+
+      - name: Save the APK (Actions → this run → Artifacts)
+        uses: actions/upload-artifact@v4
+        with:
+          name: AS532-Trainer-APK
+          path: AS532-Trainer.apk
+
+      - name: Publish the APK (Releases, easy download on a phone)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: AS 532 Trainer 1.0.${{ github.run_number }}
+          body: |
+            Download AS532-Trainer.apk below and open it on your Android phone.
+            ${{ env.NOTE }}
+          files: AS532-Trainer.apk
